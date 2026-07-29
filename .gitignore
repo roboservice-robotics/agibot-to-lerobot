@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Converted output — regenerate with convert.py, not tracked in git
+/lerobot_format/

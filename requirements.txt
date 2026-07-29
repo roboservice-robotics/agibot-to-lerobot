@@ -1,0 +1,11 @@
+# Pinned to the last lerobot release that writes LeRobot v2.1 by default
+# (v0.4.0 switched LeRobotDataset.create() to always write v3.0, with no
+# version-selection flag - see the plan doc / commit message for how this
+# was confirmed against lerobot's own source).
+lerobot==0.3.3
+protobuf==5.28.3
+numpy
+
+# genie_msgs_pb (protobuf message definitions for cosine_bus topics) isn't on
+# PyPI - install from the vendored wheel copied out of the GDK SDK cache:
+#   pip install vendor/genie_msgs_pb-1.4.3-py3-none-any.whl
