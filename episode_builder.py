@@ -70,9 +70,39 @@ def _load_meta_info(recording_dir: Path) -> dict[str, Any]:
 
 
 def _task_instruction(meta: dict[str, Any]) -> str:
-    text = json.loads(meta["text"])
+    """Task/language instruction for the episode, read from meta_info.json's `text` field.
+
+    `text` holds a JSON document stored as a *string*, so it needs parsing a second time.
+    Recordings in the wild have been seen with it empty (`""`), which `json.loads` rejects -
+    and an unusable instruction is a metadata gap, not a reason to throw away an otherwise
+    good trajectory. So anything missing, empty, or unparseable yields "" with a warning
+    rather than an exception. Pass `--instruction` to `convert.py` to supply one by hand.
+    """
+    raw = meta.get("text") or ""
+    if not raw.strip():
+        logger.warning("meta_info.json has no task instruction text - converting with an empty instruction")
+        return ""
+
+    try:
+        text = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning(
+            "meta_info.json 'text' is not valid JSON (%r) - converting with an empty instruction", raw[:80]
+        )
+        return ""
+
+    if not isinstance(text, dict):
+        logger.warning(
+            "meta_info.json 'text' parsed to %s, expected an object - converting with an empty instruction",
+            type(text).__name__,
+        )
+        return ""
+
     parts = [text.get("description", ""), *text.get("extra", [])]
-    return ". ".join(p.strip() for p in parts if p.strip())
+    instruction = ". ".join(p.strip() for p in parts if isinstance(p, str) and p.strip())
+    if not instruction:
+        logger.warning("meta_info.json 'text' has no description/extra content - empty instruction")
+    return instruction
 
 
 def _read_joint_series(path: Path, message_cls: type, position_attr: str) -> list[tuple[int, dict[str, float]]]:
@@ -98,13 +128,80 @@ def _read_vr_gripper_series(path: Path) -> list[tuple[int, tuple[float | None, f
     return [(ts, gripper_openness_command(payload)) for ts, payload in read_pbdat_raw_frames(path)]
 
 
-def build_episode(recording_dir: Path, output_root: Path, repo_id: str) -> None:
-    """Converts one raw Genie Studio recording into a LeRobot v2.1 dataset at `output_root`."""
+# Recorded timestamps are epoch nanoseconds (verified against real recordings: values ~1.78e18,
+# consecutive head-camera frames ~33.3e6 ns apart at 30 fps).
+NS_PER_S = 1_000_000_000
+
+# A frame whose gap from its predecessor exceeds this multiple of the nominal frame period is
+# treated as a camera drop rather than normal jitter. Real recordings show drops up to ~1.4 s
+# against a 33 ms nominal period, so anything past 2x is unambiguous.
+GAP_FACTOR = 2.0
+
+
+def _detect_gaps(timestamps_ns: list[int], fps: float) -> list[dict[str, float]]:
+    """Finds camera-drop gaps in a frame timestamp series.
+
+    LeRobot is handed uniform synthetic timestamps (see the comment in `build_episode`'s
+    frame loop), so the real timing is lost in the dataset itself. Anything computing a rate
+    of change - joint velocity, jerk - would silently treat a 1.4 s drop as one frame period
+    and report a huge false spike. Recording the gaps here lets consumers exclude those
+    frames instead.
+
+    Returns one entry per gap: the index of the frame *after* the gap, and the real elapsed
+    time in seconds.
+    """
+    if fps <= 0:
+        return []
+    nominal_dt_s = 1.0 / fps
+    gaps = []
+    for i in range(1, len(timestamps_ns)):
+        dt_s = (timestamps_ns[i] - timestamps_ns[i - 1]) / NS_PER_S
+        if dt_s > nominal_dt_s * GAP_FACTOR:
+            gaps.append({"frame_index": i, "dt_s": round(dt_s, 6)})
+    return gaps
+
+
+def _gripper_mapping_verifiable(openness_series: list[tuple[float | None, float | None]]) -> bool:
+    """Whether this recording could confirm the VR controller left/right assignment.
+
+    `vr_trigger_parser` maps controller index 0 to the left gripper and 1 to the right, but
+    that mapping is an unverified guess (see its docstring) - no recording tested so far had
+    the two hands do different things, and while both grippers move together a swap is
+    invisible. If the two signals differ meaningfully somewhere in this episode, then this
+    recording *would* expose a swap, so the mapping is verifiable from it.
+    """
+    diffs = [abs(l - r) for l, r in openness_series if l is not None and r is not None]
+    return bool(diffs) and max(diffs) > 0.05
+
+
+def _write_conversion_sidecar(output_root: Path, payload: dict[str, Any]) -> None:
+    """Writes provenance that LeRobot's own schema has nowhere to put.
+
+    Three things a consumer needs but the dataset cannot express: which action dimensions are
+    real vs zero-filled, the true frame timing (LeRobot only gets uniform synthetic
+    timestamps), and whether the gripper left/right mapping was verifiable. Kept in our own
+    file under `meta/` rather than bent into `info.json`, whose schema belongs to lerobot.
+    """
+    sidecar = output_root / "meta" / "agibot_conversion.json"
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(json.dumps(payload, indent=2))
+    logger.info("Wrote conversion sidecar %s", sidecar)
+
+
+def build_episode(
+    recording_dir: Path, output_root: Path, repo_id: str, instruction: str | None = None
+) -> None:
+    """Converts one raw Genie Studio recording into a LeRobot v2.1 dataset at `output_root`.
+
+    `instruction` overrides the task text from meta_info.json. Needed because recordings are
+    routinely made with no instruction text at all, and a VLA trained on an empty instruction
+    learns nothing from the language channel.
+    """
     from genie_msgs_pb.msg import JointCommand_pb2, JointState_pb2
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     meta = _load_meta_info(recording_dir)
-    instruction = _task_instruction(meta)
+    instruction = instruction if instruction is not None else _task_instruction(meta)
     record_dir = recording_dir / "record"
     camera_dir = recording_dir / "camera"
 
@@ -169,13 +266,23 @@ def build_episode(recording_dir: Path, output_root: Path, repo_id: str) -> None:
     head_h265 = camera_dir / HEAD_CAMERA / f"{HEAD_CAMERA}.h265"
     head_txt = camera_dir / HEAD_CAMERA / f"{HEAD_CAMERA}.txt"
 
+    # Accumulated for the conversion sidecar written after the episode is saved.
+    head_timestamps_ns: list[int] = []
+    openness_series: list[tuple[float | None, float | None]] = []
+    # Joints seen in joint_cmd at least once. Anything in joint_names but missing here is
+    # zero-filled into `action` below, which would be a fabricated ground-truth value.
+    cmd_covered: set[str] = set()
+
     frame_count = 0
     for ts, head_frame in decode_h265_frames(head_h265, head_txt):
         state_joints = joint_state_cursor.get(ts) or {}
         cmd_joints = joint_cmd_cursor.get(ts) or {}
+        head_timestamps_ns.append(ts)
+        cmd_covered.update(cmd_joints)
         left_state = (left_ee_cursor.get(ts) or {}).get(left_gripper_name, left_closed)
         right_state = (right_ee_cursor.get(ts) or {}).get(right_gripper_name, right_closed)
         left_openness, right_openness = vr_cursor.get(ts) or (None, None)
+        openness_series.append((left_openness, right_openness))
 
         left_action = left_closed + left_openness * (left_open - left_closed) if left_openness is not None else left_state
         right_action = right_closed + right_openness * (right_open - right_closed) if right_openness is not None else right_state
@@ -203,4 +310,59 @@ def build_episode(recording_dir: Path, output_root: Path, repo_id: str) -> None:
         frame_count += 1
 
     dataset.save_episode()
+
+    uncovered = [n for n in joint_names if n not in cmd_covered]
+    if uncovered:
+        logger.warning(
+            "joint_cmd never reported %d of %d joints (%s) - their `action` values are "
+            "zero-filled, not real commands. Recorded in the sidecar so downstream consumers "
+            "can exclude them.",
+            len(uncovered), len(joint_names), ", ".join(uncovered),
+        )
+
+    gaps = _detect_gaps(head_timestamps_ns, fps)
+    if gaps:
+        logger.warning(
+            "%d camera-drop gap(s) detected, largest %.2fs - LeRobot's timestamps are uniform "
+            "and hide these; real timing is in the sidecar.",
+            len(gaps), max(g["dt_s"] for g in gaps),
+        )
+
+    mapping_verifiable = _gripper_mapping_verifiable(openness_series)
+    if not mapping_verifiable:
+        logger.warning(
+            "Both grippers moved together throughout this recording, so it cannot confirm the "
+            "VR controller left/right mapping (see vr_trigger_parser). Gripper actions may be "
+            "swapped; treat gripper metrics as unverified."
+        )
+
+    _write_conversion_sidecar(output_root, {
+        "schema_version": 1,
+        "source_recording": recording_dir.name,
+        "instruction": instruction,
+        "state_names": state_names,
+        "nominal_fps": round(fps),
+        "frame_count": frame_count,
+        # Action dims backed by real commands vs zero-filled. Metrics computed against a
+        # zero-filled dimension are meaningless, so consumers must exclude `action_uncovered`.
+        "action_covered": [n for n in joint_names if n in cmd_covered],
+        "action_uncovered": uncovered,
+        # Real recorded frame times, seconds from episode start. LeRobot only stores uniform
+        # frame_index/fps timestamps, so this is the only record of true timing.
+        "timestamps_s": [
+            round((ts - head_timestamps_ns[0]) / NS_PER_S, 6) for ts in head_timestamps_ns
+        ] if head_timestamps_ns else [],
+        "start_timestamp_ns": head_timestamps_ns[0] if head_timestamps_ns else None,
+        "gap_frames": gaps,
+        "gripper": {
+            "left_name": left_gripper_name,
+            "right_name": right_gripper_name,
+            "left_open": left_open,
+            "left_closed": left_closed,
+            "right_open": right_open,
+            "right_closed": right_closed,
+            "lr_mapping_verifiable_from_this_recording": mapping_verifiable,
+        },
+    })
+
     logger.info("Converted %s -> %s (%d frames)", recording_dir, output_root, frame_count)
