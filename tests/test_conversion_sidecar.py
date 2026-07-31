@@ -96,7 +96,7 @@ def test_empty_series_is_not_verifiable():
 
 def test_sidecar_lands_under_meta_and_round_trips(tmp_path):
     payload = {"schema_version": 1, "action_uncovered": ["idx01_body_joint1"]}
-    _write_conversion_sidecar(tmp_path, payload)
+    _write_conversion_sidecar(tmp_path, "agibot_conversion.json", payload)
 
     written = tmp_path / "meta" / "agibot_conversion.json"
     assert written.is_file()
@@ -104,5 +104,11 @@ def test_sidecar_lands_under_meta_and_round_trips(tmp_path):
 
 
 def test_sidecar_creates_meta_dir_if_absent(tmp_path):
-    _write_conversion_sidecar(tmp_path / "fresh", {"schema_version": 1})
+    _write_conversion_sidecar(tmp_path / "fresh", "agibot_conversion.json", {"schema_version": 1})
     assert (tmp_path / "fresh" / "meta" / "agibot_conversion.json").is_file()
+
+
+def test_sidecar_honors_custom_name(tmp_path):
+    # Batch conversion writes one sidecar per source recording under distinct names.
+    _write_conversion_sidecar(tmp_path, "agibot_conversion.rec-a.json", {"schema_version": 1})
+    assert (tmp_path / "meta" / "agibot_conversion.rec-a.json").is_file()

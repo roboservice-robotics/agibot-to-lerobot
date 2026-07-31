@@ -174,7 +174,7 @@ def _gripper_mapping_verifiable(openness_series: list[tuple[float | None, float 
     return bool(diffs) and max(diffs) > 0.05
 
 
-def _write_conversion_sidecar(output_root: Path, payload: dict[str, Any]) -> None:
+def _write_conversion_sidecar(output_root: Path, name: str, payload: dict[str, Any]) -> None:
     """Writes provenance that LeRobot's own schema has nowhere to put.
 
     Three things a consumer needs but the dataset cannot express: which action dimensions are
@@ -182,20 +182,38 @@ def _write_conversion_sidecar(output_root: Path, payload: dict[str, Any]) -> Non
     timestamps), and whether the gripper left/right mapping was verifiable. Kept in our own
     file under `meta/` rather than bent into `info.json`, whose schema belongs to lerobot.
     """
-    sidecar = output_root / "meta" / "agibot_conversion.json"
+    sidecar = output_root / "meta" / name
     sidecar.parent.mkdir(parents=True, exist_ok=True)
     sidecar.write_text(json.dumps(payload, indent=2))
     logger.info("Wrote conversion sidecar %s", sidecar)
 
 
 def build_episode(
-    recording_dir: Path, output_root: Path, repo_id: str, instruction: str | None = None
-) -> None:
-    """Converts one raw Genie Studio recording into a LeRobot v2.1 dataset at `output_root`.
+    recording_dir: Path,
+    output_root: Path,
+    repo_id: str,
+    instruction: str | None = None,
+    dataset: Any | None = None,
+    sidecar_name: str = "agibot_conversion.json",
+) -> Any:
+    """Converts one raw Genie Studio recording into an episode of a LeRobot v2.1 dataset.
+
+    With `dataset=None` (the original single-recording mode) a new dataset is created at
+    `output_root` holding just this episode. Passing the returned dataset back in appends
+    the next recording as a further episode of the same dataset - that is how a whole
+    task's recordings become one training set (see vla-training/convert_task.py). In
+    append mode the recording must match the schema the dataset was created with (joint
+    names, fps, camera resolutions), otherwise ValueError is raised so the caller can
+    skip the recording instead of writing misaligned data.
 
     `instruction` overrides the task text from meta_info.json. Needed because recordings are
     routinely made with no instruction text at all, and a VLA trained on an empty instruction
     learns nothing from the language channel.
+
+    `sidecar_name` names the provenance sidecar under `meta/` - batch callers pass a
+    per-recording name so episodes do not overwrite each other's sidecars.
+
+    Returns the dataset (newly created or the one passed in).
     """
     from genie_msgs_pb.msg import JointCommand_pb2, JointState_pb2
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -254,14 +272,29 @@ def build_episode(
         }
     assert fps is not None
 
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        fps=round(fps),
-        features=features,
-        root=output_root,
-        robot_type="agibot_g2",
-        use_videos=True,
-    )
+    if dataset is None:
+        dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=round(fps),
+            features=features,
+            root=output_root,
+            robot_type="agibot_g2",
+            use_videos=True,
+        )
+    else:
+        # Append mode: refuse any recording whose schema differs from the dataset's,
+        # since LeRobot would either crash mid-write or silently misalign the data.
+        existing_names = dataset.features["observation.state"]["names"]
+        if existing_names != state_names:
+            raise ValueError(f"{recording_dir.name}: joint names differ from the dataset's")
+        if round(fps) != dataset.fps:
+            raise ValueError(f"{recording_dir.name}: fps {round(fps)} != dataset fps {dataset.fps}")
+        for key in (f"observation.images.{cam}" for cam in ALL_CAMERAS):
+            if tuple(features[key]["shape"]) != tuple(dataset.features[key]["shape"]):
+                raise ValueError(
+                    f"{recording_dir.name}: {key} shape {features[key]['shape']} != "
+                    f"dataset's {dataset.features[key]['shape']}"
+                )
 
     head_h265 = camera_dir / HEAD_CAMERA / f"{HEAD_CAMERA}.h265"
     head_txt = camera_dir / HEAD_CAMERA / f"{HEAD_CAMERA}.txt"
@@ -336,7 +369,7 @@ def build_episode(
             "swapped; treat gripper metrics as unverified."
         )
 
-    _write_conversion_sidecar(output_root, {
+    _write_conversion_sidecar(output_root, sidecar_name, {
         "schema_version": 1,
         "source_recording": recording_dir.name,
         "instruction": instruction,
@@ -366,3 +399,4 @@ def build_episode(
     })
 
     logger.info("Converted %s -> %s (%d frames)", recording_dir, output_root, frame_count)
+    return dataset
