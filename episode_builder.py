@@ -296,6 +296,10 @@ def build_episode(
             root=output_root,
             robot_type="agibot_g2",
             use_videos=True,
+            # Async image writing: without these, every frame JPEG is written
+            # synchronously in the main loop and conversion runs single-core.
+            image_writer_processes=4,
+            image_writer_threads=4,
         )
     else:
         # Append mode: refuse any recording whose schema differs from the dataset's,
