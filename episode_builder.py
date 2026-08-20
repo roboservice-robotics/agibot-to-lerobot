@@ -57,15 +57,30 @@ class NearestCursor:
         return self._prev[1] if self._prev is not None else None
 
 
-def _load_meta_info(recording_dir: Path) -> dict[str, Any]:
+def _load_meta_info(recording_dir: Path, allow_unvalidated: bool = False) -> dict[str, Any]:
+    """Reads meta_info.json and applies Genie Studio's QA verdicts.
+
+    Some exports carry no data_validate/integrity fields at all (seen on ~99
+    otherwise-complete 2026-07/08 recordings) - that means "never QA'd", not
+    "failed QA". `allow_unvalidated=True` converts those with a warning; an
+    explicit False verdict is always refused.
+    """
     meta = json.loads((recording_dir / "meta_info.json").read_text())
-    if not meta.get("data_validate", {}).get("validate", False):
-        raise ValueError(f"{recording_dir}: failed Genie Studio's data_validate check")
+    validate = meta.get("data_validate", {}).get("validate")
     integrity = meta.get("integrity", {})
-    if not integrity.get("integrity", False):
+    if validate is False:
+        raise ValueError(f"{recording_dir}: failed Genie Studio's data_validate check")
+    if integrity.get("integrity") is False:
         raise ValueError(
             f"{recording_dir}: failed Genie Studio's integrity check (reason={integrity.get('reason')})"
         )
+    if validate is None or integrity.get("integrity") is None:
+        if not allow_unvalidated:
+            raise ValueError(
+                f"{recording_dir}: meta_info.json has no Genie Studio validation fields; "
+                "pass --allow-unvalidated to convert anyway"
+            )
+        logger.warning("%s: no Genie Studio validation fields - converting unreviewed", recording_dir)
     return meta
 
 
@@ -195,6 +210,7 @@ def build_episode(
     instruction: str | None = None,
     dataset: Any | None = None,
     sidecar_name: str = "agibot_conversion.json",
+    allow_unvalidated: bool = False,
 ) -> Any:
     """Converts one raw Genie Studio recording into an episode of a LeRobot v2.1 dataset.
 
@@ -218,7 +234,7 @@ def build_episode(
     from genie_msgs_pb.msg import JointCommand_pb2, JointState_pb2
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    meta = _load_meta_info(recording_dir)
+    meta = _load_meta_info(recording_dir, allow_unvalidated=allow_unvalidated)
     instruction = instruction if instruction is not None else _task_instruction(meta)
     record_dir = recording_dir / "record"
     camera_dir = recording_dir / "camera"

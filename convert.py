@@ -54,6 +54,12 @@ def main() -> int:
         "often made with no instruction text, and training on an empty one wastes the "
         "language channel.",
     )
+    parser.add_argument(
+        "--allow-unvalidated",
+        action="store_true",
+        help="Convert recordings whose meta_info.json has no Genie Studio validation fields "
+        "(never QA'd). Recordings Genie explicitly failed are still refused.",
+    )
     args = parser.parse_args()
 
     if not args.input.is_dir():
@@ -62,7 +68,13 @@ def main() -> int:
     output = args.output if args.output is not None else DEFAULT_OUTPUT_ROOT / slugify(args.input.name)
 
     try:
-        build_episode(args.input, output, args.repo_id, instruction=args.instruction)
+        build_episode(
+            args.input,
+            output,
+            args.repo_id,
+            instruction=args.instruction,
+            allow_unvalidated=args.allow_unvalidated,
+        )
     except ValueError as exc:
         logger.error("Skipped %s: %s", args.input, exc)
         return 1
