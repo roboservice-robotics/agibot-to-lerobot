@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -17,9 +18,21 @@ from episode_builder import build_episode
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Default landing spot for converted datasets, next to this script — this is what the
+# Default landing spot for converted datasets, next to this script - this is what the
 # vla-app docker-compose.yml mounts as its episodes directory.
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "lerobot_format"
+
+
+def slugify(name: str) -> str:
+    """Makes a recording name safe to use as a dataset directory name.
+
+    Raw recordings are named from the task text, so they routinely contain spaces and other
+    characters ("Arranging the internals_20260728225028"). vla-app uses the directory name as
+    an episode id in URLs and only accepts letters, digits, dash and underscore, so an
+    unsanitised name produces a dataset it will refuse to serve.
+    """
+    slug = re.sub(r"[^a-z0-9_-]+", "_", name.lower()).strip("_")
+    return slug or "recording"
 
 
 def main() -> int:
@@ -34,15 +47,34 @@ def main() -> int:
     parser.add_argument(
         "--repo-id", default="local/agibot_g2", help="Local repo id passed to LeRobotDataset.create()"
     )
+    parser.add_argument(
+        "--instruction",
+        default=None,
+        help="Task instruction to use instead of meta_info.json's text field. Recordings are "
+        "often made with no instruction text, and training on an empty one wastes the "
+        "language channel.",
+    )
+    parser.add_argument(
+        "--allow-unvalidated",
+        action="store_true",
+        help="Convert recordings whose meta_info.json has no Genie Studio validation fields "
+        "(never QA'd). Recordings Genie explicitly failed are still refused.",
+    )
     args = parser.parse_args()
 
     if not args.input.is_dir():
         parser.error(f"--input {args.input} is not a directory")
 
-    output = args.output if args.output is not None else DEFAULT_OUTPUT_ROOT / args.input.name
+    output = args.output if args.output is not None else DEFAULT_OUTPUT_ROOT / slugify(args.input.name)
 
     try:
-        build_episode(args.input, output, args.repo_id)
+        build_episode(
+            args.input,
+            output,
+            args.repo_id,
+            instruction=args.instruction,
+            allow_unvalidated=args.allow_unvalidated,
+        )
     except ValueError as exc:
         logger.error("Skipped %s: %s", args.input, exc)
         return 1

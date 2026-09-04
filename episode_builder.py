@@ -8,7 +8,10 @@ frame timestamps as the episode's reference timeline.
 
 Scope (see the project's planning notes for why): joint_state -> observation.state,
 joint_cmd -> action, for arms/body/head; left/right gripper measured position folded
-into observation.state, commanded gripper openness (from vr_data) folded into action.
+into BOTH observation.state and action. The gripper has no command channel in joint_cmd,
+and the earlier VR-trigger reconstruction only weakly tracked the real fingers (corr ~0.2,
+verified 2026-09-04), so the measured joint angle is used directly as the gripper action.
+Convention (ground-truthed from the hand cameras): 0.0 = closed, -0.785 = open.
 RGB cameras only (head_color, hand_left_color, hand_right_color) - no depth, no
 lidar/imu/chassis/nav topics.
 """
@@ -23,9 +26,8 @@ from typing import Any, TypeVar
 
 import numpy as np
 
-from pbdat_reader import read_pbdat_frames, read_pbdat_raw_frames
+from pbdat_reader import read_pbdat_frames
 from video_decoder import decode_h265_frames, probe_video_info
-from vr_trigger_parser import gripper_openness_command
 
 logger = logging.getLogger(__name__)
 
@@ -57,22 +59,67 @@ class NearestCursor:
         return self._prev[1] if self._prev is not None else None
 
 
-def _load_meta_info(recording_dir: Path) -> dict[str, Any]:
+def _load_meta_info(recording_dir: Path, allow_unvalidated: bool = False) -> dict[str, Any]:
+    """Reads meta_info.json and applies Genie Studio's QA verdicts.
+
+    Some exports carry no data_validate/integrity fields at all (seen on ~99
+    otherwise-complete 2026-07/08 recordings) - that means "never QA'd", not
+    "failed QA". `allow_unvalidated=True` converts those with a warning; an
+    explicit False verdict is always refused.
+    """
     meta = json.loads((recording_dir / "meta_info.json").read_text())
-    if not meta.get("data_validate", {}).get("validate", False):
-        raise ValueError(f"{recording_dir}: failed Genie Studio's data_validate check")
+    validate = meta.get("data_validate", {}).get("validate")
     integrity = meta.get("integrity", {})
-    if not integrity.get("integrity", False):
+    if validate is False:
+        raise ValueError(f"{recording_dir}: failed Genie Studio's data_validate check")
+    if integrity.get("integrity") is False:
         raise ValueError(
             f"{recording_dir}: failed Genie Studio's integrity check (reason={integrity.get('reason')})"
         )
+    if validate is None or integrity.get("integrity") is None:
+        if not allow_unvalidated:
+            raise ValueError(
+                f"{recording_dir}: meta_info.json has no Genie Studio validation fields; "
+                "pass --allow-unvalidated to convert anyway"
+            )
+        logger.warning("%s: no Genie Studio validation fields - converting unreviewed", recording_dir)
     return meta
 
 
 def _task_instruction(meta: dict[str, Any]) -> str:
-    text = json.loads(meta["text"])
+    """Task/language instruction for the episode, read from meta_info.json's `text` field.
+
+    `text` holds a JSON document stored as a *string*, so it needs parsing a second time.
+    Recordings in the wild have been seen with it empty (`""`), which `json.loads` rejects -
+    and an unusable instruction is a metadata gap, not a reason to throw away an otherwise
+    good trajectory. So anything missing, empty, or unparseable yields "" with a warning
+    rather than an exception. Pass `--instruction` to `convert.py` to supply one by hand.
+    """
+    raw = meta.get("text") or ""
+    if not raw.strip():
+        logger.warning("meta_info.json has no task instruction text - converting with an empty instruction")
+        return ""
+
+    try:
+        text = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning(
+            "meta_info.json 'text' is not valid JSON (%r) - converting with an empty instruction", raw[:80]
+        )
+        return ""
+
+    if not isinstance(text, dict):
+        logger.warning(
+            "meta_info.json 'text' parsed to %s, expected an object - converting with an empty instruction",
+            type(text).__name__,
+        )
+        return ""
+
     parts = [text.get("description", ""), *text.get("extra", [])]
-    return ". ".join(p.strip() for p in parts if p.strip())
+    instruction = ". ".join(p.strip() for p in parts if isinstance(p, str) and p.strip())
+    if not instruction:
+        logger.warning("meta_info.json 'text' has no description/extra content - empty instruction")
+    return instruction
 
 
 def _read_joint_series(path: Path, message_cls: type, position_attr: str) -> list[tuple[int, dict[str, float]]]:
@@ -94,17 +141,99 @@ def _read_end_state_series(path: Path) -> list[tuple[int, dict[str, float]]]:
     return frames
 
 
-def _read_vr_gripper_series(path: Path) -> list[tuple[int, tuple[float | None, float | None]]]:
-    return [(ts, gripper_openness_command(payload)) for ts, payload in read_pbdat_raw_frames(path)]
+# Recorded timestamps are epoch nanoseconds (verified against real recordings: values ~1.78e18,
+# consecutive head-camera frames ~33.3e6 ns apart at 30 fps).
+NS_PER_S = 1_000_000_000
+
+# A frame whose gap from its predecessor exceeds this multiple of the nominal frame period is
+# treated as a camera drop rather than normal jitter. Real recordings show drops up to ~1.4 s
+# against a 33 ms nominal period, so anything past 2x is unambiguous.
+GAP_FACTOR = 2.0
 
 
-def build_episode(recording_dir: Path, output_root: Path, repo_id: str) -> None:
-    """Converts one raw Genie Studio recording into a LeRobot v2.1 dataset at `output_root`."""
+def _detect_gaps(timestamps_ns: list[int], fps: float) -> list[dict[str, float]]:
+    """Finds camera-drop gaps in a frame timestamp series.
+
+    LeRobot is handed uniform synthetic timestamps (see the comment in `build_episode`'s
+    frame loop), so the real timing is lost in the dataset itself. Anything computing a rate
+    of change - joint velocity, jerk - would silently treat a 1.4 s drop as one frame period
+    and report a huge false spike. Recording the gaps here lets consumers exclude those
+    frames instead.
+
+    Returns one entry per gap: the index of the frame *after* the gap, and the real elapsed
+    time in seconds.
+    """
+    if fps <= 0:
+        return []
+    nominal_dt_s = 1.0 / fps
+    gaps = []
+    for i in range(1, len(timestamps_ns)):
+        dt_s = (timestamps_ns[i] - timestamps_ns[i - 1]) / NS_PER_S
+        if dt_s > nominal_dt_s * GAP_FACTOR:
+            gaps.append({"frame_index": i, "dt_s": round(dt_s, 6)})
+    return gaps
+
+
+def _write_conversion_sidecar(output_root: Path, name: str, payload: dict[str, Any]) -> None:
+    """Writes provenance that LeRobot's own schema has nowhere to put.
+
+    Two things a consumer needs but the dataset cannot express: which action dimensions are
+    real vs zero-filled, and the true frame timing (LeRobot only gets uniform synthetic
+    timestamps). Kept in our own file under `meta/` rather than bent into `info.json`, whose
+    schema belongs to lerobot.
+    """
+    sidecar = output_root / "meta" / name
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(json.dumps(payload, indent=2))
+    logger.info("Wrote conversion sidecar %s", sidecar)
+
+
+
+# Gripper joint value when the ee stream has no reading for a frame: 0.0 = closed
+# (ground-truthed from the hand cameras), the safe default for an idle gripper.
+GRIPPER_CLOSED_RAD = 0.0
+
+
+def build_episode(
+    recording_dir: Path,
+    output_root: Path,
+    repo_id: str,
+    instruction: str | None = None,
+    dataset: Any | None = None,
+    sidecar_name: str = "agibot_conversion.json",
+    allow_unvalidated: bool = False,
+    frame_range: tuple[int, int | None] | None = None,
+) -> Any:
+    """Converts one raw Genie Studio recording into an episode of a LeRobot v2.1 dataset.
+
+    With `dataset=None` (the original single-recording mode) a new dataset is created at
+    `output_root` holding just this episode. Passing the returned dataset back in appends
+    the next recording as a further episode of the same dataset - that is how a whole
+    task's recordings become one training set (see vla-training/convert_task.py). In
+    append mode the recording must match the schema the dataset was created with (joint
+    names, fps, camera resolutions), otherwise ValueError is raised so the caller can
+    skip the recording instead of writing misaligned data.
+
+    `instruction` overrides the task text from meta_info.json. Needed because recordings are
+    routinely made with no instruction text at all, and a VLA trained on an empty instruction
+    learns nothing from the language channel.
+
+    `sidecar_name` names the provenance sidecar under `meta/` - batch callers pass a
+    per-recording name so episodes do not overwrite each other's sidecars.
+
+    `frame_range` as (start, end) converts only that half-open slice of head-camera
+    frames into the episode, instead of the whole recording (end=None means "to the
+    recording's end"). Frame indices count decoded head-camera frames from 0, the same
+    timeline Genie Studio's annotation tool uses. Used to split one long end-to-end
+    recording into separately-prompted sub-task episodes.
+
+    Returns the dataset (newly created or the one passed in).
+    """
     from genie_msgs_pb.msg import JointCommand_pb2, JointState_pb2
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    meta = _load_meta_info(recording_dir)
-    instruction = _task_instruction(meta)
+    meta = _load_meta_info(recording_dir, allow_unvalidated=allow_unvalidated)
+    instruction = instruction if instruction is not None else _task_instruction(meta)
     record_dir = recording_dir / "record"
     camera_dir = recording_dir / "camera"
 
@@ -112,27 +241,16 @@ def build_episode(recording_dir: Path, output_root: Path, repo_id: str) -> None:
     joint_cmd_frames = _read_joint_series(record_dir / "-hal-joint_cmd.pbdat", JointCommand_pb2.JointCommand, "position")
     left_ee_frames = _read_end_state_series(record_dir / "-hal-left_ee_data.pbdat")
     right_ee_frames = _read_end_state_series(record_dir / "-hal-right_ee_data.pbdat")
-    vr_frames = _read_vr_gripper_series(record_dir / "-remote-vr_data.pbdat")
 
     joint_names = list(joint_state_frames[0][1].keys())
     left_gripper_name = next(iter(left_ee_frames[0][1].keys()))
     right_gripper_name = next(iter(right_ee_frames[0][1].keys()))
     state_names = [*joint_names, left_gripper_name, right_gripper_name]
 
-    # This episode's own observed open/closed range, used to scale vr_data's 0-1
-    # commanded-openness value into the same physical (radian) unit as state -
-    # deliberately not a hardcoded constant, since gripper hardware (and so its
-    # position range) differs between recordings (omnipicker vs. ctek90d seen so far).
-    left_positions = [v[left_gripper_name] for _, v in left_ee_frames]
-    right_positions = [v[right_gripper_name] for _, v in right_ee_frames]
-    left_open, left_closed = max(left_positions), min(left_positions)
-    right_open, right_closed = max(right_positions), min(right_positions)
-
     joint_state_cursor = NearestCursor(joint_state_frames)
     joint_cmd_cursor = NearestCursor(joint_cmd_frames)
     left_ee_cursor = NearestCursor(left_ee_frames)
     right_ee_cursor = NearestCursor(right_ee_frames)
-    vr_cursor = NearestCursor(vr_frames)
 
     # NearestCursor consumes these lazily (it only needs an iterable), so the
     # hand cameras' decoded frames are never all held in memory at once.
@@ -157,31 +275,63 @@ def build_episode(recording_dir: Path, output_root: Path, repo_id: str) -> None:
         }
     assert fps is not None
 
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        fps=round(fps),
-        features=features,
-        root=output_root,
-        robot_type="agibot_g2",
-        use_videos=True,
-    )
+    if dataset is None:
+        dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=round(fps),
+            features=features,
+            root=output_root,
+            robot_type="agibot_g2",
+            use_videos=True,
+            # Async image writing: without these, every frame JPEG is written
+            # synchronously in the main loop and conversion runs single-core.
+            image_writer_processes=4,
+            image_writer_threads=4,
+        )
+    else:
+        # Append mode: refuse any recording whose schema differs from the dataset's,
+        # since LeRobot would either crash mid-write or silently misalign the data.
+        existing_names = dataset.features["observation.state"]["names"]
+        if existing_names != state_names:
+            raise ValueError(f"{recording_dir.name}: joint names differ from the dataset's")
+        if round(fps) != dataset.fps:
+            raise ValueError(f"{recording_dir.name}: fps {round(fps)} != dataset fps {dataset.fps}")
+        for key in (f"observation.images.{cam}" for cam in ALL_CAMERAS):
+            if tuple(features[key]["shape"]) != tuple(dataset.features[key]["shape"]):
+                raise ValueError(
+                    f"{recording_dir.name}: {key} shape {features[key]['shape']} != "
+                    f"dataset's {dataset.features[key]['shape']}"
+                )
 
     head_h265 = camera_dir / HEAD_CAMERA / f"{HEAD_CAMERA}.h265"
     head_txt = camera_dir / HEAD_CAMERA / f"{HEAD_CAMERA}.txt"
 
+    # Accumulated for the conversion sidecar written after the episode is saved.
+    head_timestamps_ns: list[int] = []
+    # Joints seen in joint_cmd at least once. Anything in joint_names but missing here is
+    # zero-filled into `action` below, which would be a fabricated ground-truth value.
+    cmd_covered: set[str] = set()
+
+    range_start, range_end = frame_range if frame_range is not None else (0, None)
     frame_count = 0
-    for ts, head_frame in decode_h265_frames(head_h265, head_txt):
+    for source_index, (ts, head_frame) in enumerate(decode_h265_frames(head_h265, head_txt)):
+        # h265 must be decoded sequentially, so pre-range frames are decoded and
+        # dropped; past the range we can stop decoding entirely.
+        if source_index < range_start:
+            continue
+        if range_end is not None and source_index >= range_end:
+            break
         state_joints = joint_state_cursor.get(ts) or {}
         cmd_joints = joint_cmd_cursor.get(ts) or {}
-        left_state = (left_ee_cursor.get(ts) or {}).get(left_gripper_name, left_closed)
-        right_state = (right_ee_cursor.get(ts) or {}).get(right_gripper_name, right_closed)
-        left_openness, right_openness = vr_cursor.get(ts) or (None, None)
+        head_timestamps_ns.append(ts)
+        cmd_covered.update(cmd_joints)
+        left_gripper = (left_ee_cursor.get(ts) or {}).get(left_gripper_name, GRIPPER_CLOSED_RAD)
+        right_gripper = (right_ee_cursor.get(ts) or {}).get(right_gripper_name, GRIPPER_CLOSED_RAD)
 
-        left_action = left_closed + left_openness * (left_open - left_closed) if left_openness is not None else left_state
-        right_action = right_closed + right_openness * (right_open - right_closed) if right_openness is not None else right_state
-
-        state_vec = [state_joints.get(n, 0.0) for n in joint_names] + [left_state, right_state]
-        action_vec = [cmd_joints.get(n, 0.0) for n in joint_names] + [left_action, right_action]
+        # The gripper has no joint_cmd channel, so its action is the measured joint angle
+        # at this same frame (state and action gripper columns are therefore identical).
+        state_vec = [state_joints.get(n, 0.0) for n in joint_names] + [left_gripper, right_gripper]
+        action_vec = [cmd_joints.get(n, 0.0) for n in joint_names] + [left_gripper, right_gripper]
 
         frame = {
             "observation.state": np.array(state_vec, dtype=np.float32),
@@ -203,4 +353,52 @@ def build_episode(recording_dir: Path, output_root: Path, repo_id: str) -> None:
         frame_count += 1
 
     dataset.save_episode()
+
+    uncovered = [n for n in joint_names if n not in cmd_covered]
+    if uncovered:
+        logger.warning(
+            "joint_cmd never reported %d of %d joints (%s) - their `action` values are "
+            "zero-filled, not real commands. Recorded in the sidecar so downstream consumers "
+            "can exclude them.",
+            len(uncovered), len(joint_names), ", ".join(uncovered),
+        )
+
+    gaps = _detect_gaps(head_timestamps_ns, fps)
+    if gaps:
+        logger.warning(
+            "%d camera-drop gap(s) detected, largest %.2fs - LeRobot's timestamps are uniform "
+            "and hide these; real timing is in the sidecar.",
+            len(gaps), max(g["dt_s"] for g in gaps),
+        )
+
+    _write_conversion_sidecar(output_root, sidecar_name, {
+        "schema_version": 1,
+        "source_recording": recording_dir.name,
+        "instruction": instruction,
+        "state_names": state_names,
+        "nominal_fps": round(fps),
+        "frame_count": frame_count,
+        # Present only for episodes cut from a slice of the recording: the half-open
+        # [start, end) head-camera frame range this episode covers.
+        **({"source_frame_range": [range_start, range_end]} if frame_range is not None else {}),
+        # Action dims backed by real commands vs zero-filled. Metrics computed against a
+        # zero-filled dimension are meaningless, so consumers must exclude `action_uncovered`.
+        "action_covered": [n for n in joint_names if n in cmd_covered],
+        "action_uncovered": uncovered,
+        # Real recorded frame times, seconds from episode start. LeRobot only stores uniform
+        # frame_index/fps timestamps, so this is the only record of true timing.
+        "timestamps_s": [
+            round((ts - head_timestamps_ns[0]) / NS_PER_S, 6) for ts in head_timestamps_ns
+        ] if head_timestamps_ns else [],
+        "start_timestamp_ns": head_timestamps_ns[0] if head_timestamps_ns else None,
+        "gap_frames": gaps,
+        "gripper": {
+            "left_name": left_gripper_name,
+            "right_name": right_gripper_name,
+            "action_source": "measured_ee_data",
+            "convention": "0.0=closed, -0.785=open",
+        },
+    })
+
     logger.info("Converted %s -> %s (%d frames)", recording_dir, output_root, frame_count)
+    return dataset
