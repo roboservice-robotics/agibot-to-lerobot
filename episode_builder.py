@@ -203,6 +203,30 @@ def _write_conversion_sidecar(output_root: Path, name: str, payload: dict[str, A
     logger.info("Wrote conversion sidecar %s", sidecar)
 
 
+
+GRIPPER_OPEN_RAD = 0.0
+GRIPPER_CLOSED_RAD = -0.785
+# A real full sweep is ~0.785 rad; below this the episode's extremes are not a
+# trustworthy calibration (unused hand, or constant-pinch teleoperation).
+MIN_TRUSTED_GRIPPER_RANGE_RAD = 0.4
+
+
+def _gripper_endpoints(positions: list[float], hand: str) -> tuple[float, float]:
+    """(open, closed) endpoints for mapping commanded openness to radians.
+
+    Prefers the episode's own measured extremes when the hand actually swept a
+    substantial range; falls back to the omnipicker hardware range otherwise
+    (see the calibration comment at the call site for why).
+    """
+    observed_open, observed_closed = max(positions), min(positions)
+    if abs(observed_open - observed_closed) >= MIN_TRUSTED_GRIPPER_RANGE_RAD:
+        return observed_open, observed_closed
+    logger.warning("%s gripper swept only %.3f rad this episode - using the "
+                   "hardware range for openness mapping", hand,
+                   abs(observed_open - observed_closed))
+    return GRIPPER_OPEN_RAD, GRIPPER_CLOSED_RAD
+
+
 def build_episode(
     recording_dir: Path,
     output_root: Path,
@@ -211,6 +235,7 @@ def build_episode(
     dataset: Any | None = None,
     sidecar_name: str = "agibot_conversion.json",
     allow_unvalidated: bool = False,
+    frame_range: tuple[int, int | None] | None = None,
 ) -> Any:
     """Converts one raw Genie Studio recording into an episode of a LeRobot v2.1 dataset.
 
@@ -228,6 +253,13 @@ def build_episode(
 
     `sidecar_name` names the provenance sidecar under `meta/` - batch callers pass a
     per-recording name so episodes do not overwrite each other's sidecars.
+
+    `frame_range` as (start, end) converts only that half-open slice of head-camera
+    frames into the episode, instead of the whole recording (end=None means "to the
+    recording's end"). Frame indices count decoded head-camera frames from 0, the same
+    timeline Genie Studio's annotation tool uses. Used to split one long end-to-end
+    recording into separately-prompted sub-task episodes; gripper open/closed scaling
+    still uses the whole recording so segments of one recording share the same units.
 
     Returns the dataset (newly created or the one passed in).
     """
@@ -250,14 +282,20 @@ def build_episode(
     right_gripper_name = next(iter(right_ee_frames[0][1].keys()))
     state_names = [*joint_names, left_gripper_name, right_gripper_name]
 
-    # This episode's own observed open/closed range, used to scale vr_data's 0-1
-    # commanded-openness value into the same physical (radian) unit as state -
-    # deliberately not a hardcoded constant, since gripper hardware (and so its
-    # position range) differs between recordings (omnipicker vs. ctek90d seen so far).
+    # Open/closed endpoints used to scale vr_data's 0-1 commanded openness into
+    # the same physical (radian) unit as state. The episode's own observed range
+    # is preferred (captures per-mount offsets, and gripper hardware differs
+    # between recordings - omnipicker vs. ctek90d seen so far). But when a hand
+    # sweeps almost no range - an unused hand, or an operator holding a constant
+    # pinch for the whole episode (seen throughout task 12152) - the observed
+    # extremes are degenerate and the linear rescale collapses, flattening every
+    # commanded value to a constant. Those hands fall back to the omnipicker's
+    # full range, verified from full-range recordings and the trigger parser's
+    # own calibration observation (trigger 1.0 = open at measured 0.0).
     left_positions = [v[left_gripper_name] for _, v in left_ee_frames]
     right_positions = [v[right_gripper_name] for _, v in right_ee_frames]
-    left_open, left_closed = max(left_positions), min(left_positions)
-    right_open, right_closed = max(right_positions), min(right_positions)
+    left_open, left_closed = _gripper_endpoints(left_positions, "left")
+    right_open, right_closed = _gripper_endpoints(right_positions, "right")
 
     joint_state_cursor = NearestCursor(joint_state_frames)
     joint_cmd_cursor = NearestCursor(joint_cmd_frames)
@@ -326,8 +364,15 @@ def build_episode(
     # zero-filled into `action` below, which would be a fabricated ground-truth value.
     cmd_covered: set[str] = set()
 
+    range_start, range_end = frame_range if frame_range is not None else (0, None)
     frame_count = 0
-    for ts, head_frame in decode_h265_frames(head_h265, head_txt):
+    for source_index, (ts, head_frame) in enumerate(decode_h265_frames(head_h265, head_txt)):
+        # h265 must be decoded sequentially, so pre-range frames are decoded and
+        # dropped; past the range we can stop decoding entirely.
+        if source_index < range_start:
+            continue
+        if range_end is not None and source_index >= range_end:
+            break
         state_joints = joint_state_cursor.get(ts) or {}
         cmd_joints = joint_cmd_cursor.get(ts) or {}
         head_timestamps_ns.append(ts)
@@ -396,6 +441,9 @@ def build_episode(
         "state_names": state_names,
         "nominal_fps": round(fps),
         "frame_count": frame_count,
+        # Present only for episodes cut from a slice of the recording: the half-open
+        # [start, end) head-camera frame range this episode covers.
+        **({"source_frame_range": [range_start, range_end]} if frame_range is not None else {}),
         # Action dims backed by real commands vs zero-filled. Metrics computed against a
         # zero-filled dimension are meaningless, so consumers must exclude `action_uncovered`.
         "action_covered": [n for n in joint_names if n in cmd_covered],
