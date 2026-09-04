@@ -8,7 +8,10 @@ frame timestamps as the episode's reference timeline.
 
 Scope (see the project's planning notes for why): joint_state -> observation.state,
 joint_cmd -> action, for arms/body/head; left/right gripper measured position folded
-into observation.state, commanded gripper openness (from vr_data) folded into action.
+into BOTH observation.state and action. The gripper has no command channel in joint_cmd,
+and the earlier VR-trigger reconstruction only weakly tracked the real fingers (corr ~0.2,
+verified 2026-09-04), so the measured joint angle is used directly as the gripper action.
+Convention (ground-truthed from the hand cameras): 0.0 = closed, -0.785 = open.
 RGB cameras only (head_color, hand_left_color, hand_right_color) - no depth, no
 lidar/imu/chassis/nav topics.
 """
@@ -23,9 +26,8 @@ from typing import Any, TypeVar
 
 import numpy as np
 
-from pbdat_reader import read_pbdat_frames, read_pbdat_raw_frames
+from pbdat_reader import read_pbdat_frames
 from video_decoder import decode_h265_frames, probe_video_info
-from vr_trigger_parser import gripper_openness_command
 
 logger = logging.getLogger(__name__)
 
@@ -139,10 +141,6 @@ def _read_end_state_series(path: Path) -> list[tuple[int, dict[str, float]]]:
     return frames
 
 
-def _read_vr_gripper_series(path: Path) -> list[tuple[int, tuple[float | None, float | None]]]:
-    return [(ts, gripper_openness_command(payload)) for ts, payload in read_pbdat_raw_frames(path)]
-
-
 # Recorded timestamps are epoch nanoseconds (verified against real recordings: values ~1.78e18,
 # consecutive head-camera frames ~33.3e6 ns apart at 30 fps).
 NS_PER_S = 1_000_000_000
@@ -176,26 +174,13 @@ def _detect_gaps(timestamps_ns: list[int], fps: float) -> list[dict[str, float]]
     return gaps
 
 
-def _gripper_mapping_verifiable(openness_series: list[tuple[float | None, float | None]]) -> bool:
-    """Whether this recording could confirm the VR controller left/right assignment.
-
-    `vr_trigger_parser` maps controller index 0 to the left gripper and 1 to the right, but
-    that mapping is an unverified guess (see its docstring) - no recording tested so far had
-    the two hands do different things, and while both grippers move together a swap is
-    invisible. If the two signals differ meaningfully somewhere in this episode, then this
-    recording *would* expose a swap, so the mapping is verifiable from it.
-    """
-    diffs = [abs(l - r) for l, r in openness_series if l is not None and r is not None]
-    return bool(diffs) and max(diffs) > 0.05
-
-
 def _write_conversion_sidecar(output_root: Path, name: str, payload: dict[str, Any]) -> None:
     """Writes provenance that LeRobot's own schema has nowhere to put.
 
-    Three things a consumer needs but the dataset cannot express: which action dimensions are
-    real vs zero-filled, the true frame timing (LeRobot only gets uniform synthetic
-    timestamps), and whether the gripper left/right mapping was verifiable. Kept in our own
-    file under `meta/` rather than bent into `info.json`, whose schema belongs to lerobot.
+    Two things a consumer needs but the dataset cannot express: which action dimensions are
+    real vs zero-filled, and the true frame timing (LeRobot only gets uniform synthetic
+    timestamps). Kept in our own file under `meta/` rather than bent into `info.json`, whose
+    schema belongs to lerobot.
     """
     sidecar = output_root / "meta" / name
     sidecar.parent.mkdir(parents=True, exist_ok=True)
@@ -204,27 +189,9 @@ def _write_conversion_sidecar(output_root: Path, name: str, payload: dict[str, A
 
 
 
-GRIPPER_OPEN_RAD = 0.0
-GRIPPER_CLOSED_RAD = -0.785
-# A real full sweep is ~0.785 rad; below this the episode's extremes are not a
-# trustworthy calibration (unused hand, or constant-pinch teleoperation).
-MIN_TRUSTED_GRIPPER_RANGE_RAD = 0.4
-
-
-def _gripper_endpoints(positions: list[float], hand: str) -> tuple[float, float]:
-    """(open, closed) endpoints for mapping commanded openness to radians.
-
-    Prefers the episode's own measured extremes when the hand actually swept a
-    substantial range; falls back to the omnipicker hardware range otherwise
-    (see the calibration comment at the call site for why).
-    """
-    observed_open, observed_closed = max(positions), min(positions)
-    if abs(observed_open - observed_closed) >= MIN_TRUSTED_GRIPPER_RANGE_RAD:
-        return observed_open, observed_closed
-    logger.warning("%s gripper swept only %.3f rad this episode - using the "
-                   "hardware range for openness mapping", hand,
-                   abs(observed_open - observed_closed))
-    return GRIPPER_OPEN_RAD, GRIPPER_CLOSED_RAD
+# Gripper joint value when the ee stream has no reading for a frame: 0.0 = closed
+# (ground-truthed from the hand cameras), the safe default for an idle gripper.
+GRIPPER_CLOSED_RAD = 0.0
 
 
 def build_episode(
@@ -258,8 +225,7 @@ def build_episode(
     frames into the episode, instead of the whole recording (end=None means "to the
     recording's end"). Frame indices count decoded head-camera frames from 0, the same
     timeline Genie Studio's annotation tool uses. Used to split one long end-to-end
-    recording into separately-prompted sub-task episodes; gripper open/closed scaling
-    still uses the whole recording so segments of one recording share the same units.
+    recording into separately-prompted sub-task episodes.
 
     Returns the dataset (newly created or the one passed in).
     """
@@ -275,33 +241,16 @@ def build_episode(
     joint_cmd_frames = _read_joint_series(record_dir / "-hal-joint_cmd.pbdat", JointCommand_pb2.JointCommand, "position")
     left_ee_frames = _read_end_state_series(record_dir / "-hal-left_ee_data.pbdat")
     right_ee_frames = _read_end_state_series(record_dir / "-hal-right_ee_data.pbdat")
-    vr_frames = _read_vr_gripper_series(record_dir / "-remote-vr_data.pbdat")
 
     joint_names = list(joint_state_frames[0][1].keys())
     left_gripper_name = next(iter(left_ee_frames[0][1].keys()))
     right_gripper_name = next(iter(right_ee_frames[0][1].keys()))
     state_names = [*joint_names, left_gripper_name, right_gripper_name]
 
-    # Open/closed endpoints used to scale vr_data's 0-1 commanded openness into
-    # the same physical (radian) unit as state. The episode's own observed range
-    # is preferred (captures per-mount offsets, and gripper hardware differs
-    # between recordings - omnipicker vs. ctek90d seen so far). But when a hand
-    # sweeps almost no range - an unused hand, or an operator holding a constant
-    # pinch for the whole episode (seen throughout task 12152) - the observed
-    # extremes are degenerate and the linear rescale collapses, flattening every
-    # commanded value to a constant. Those hands fall back to the omnipicker's
-    # full range, verified from full-range recordings and the trigger parser's
-    # own calibration observation (trigger 1.0 = open at measured 0.0).
-    left_positions = [v[left_gripper_name] for _, v in left_ee_frames]
-    right_positions = [v[right_gripper_name] for _, v in right_ee_frames]
-    left_open, left_closed = _gripper_endpoints(left_positions, "left")
-    right_open, right_closed = _gripper_endpoints(right_positions, "right")
-
     joint_state_cursor = NearestCursor(joint_state_frames)
     joint_cmd_cursor = NearestCursor(joint_cmd_frames)
     left_ee_cursor = NearestCursor(left_ee_frames)
     right_ee_cursor = NearestCursor(right_ee_frames)
-    vr_cursor = NearestCursor(vr_frames)
 
     # NearestCursor consumes these lazily (it only needs an iterable), so the
     # hand cameras' decoded frames are never all held in memory at once.
@@ -359,7 +308,6 @@ def build_episode(
 
     # Accumulated for the conversion sidecar written after the episode is saved.
     head_timestamps_ns: list[int] = []
-    openness_series: list[tuple[float | None, float | None]] = []
     # Joints seen in joint_cmd at least once. Anything in joint_names but missing here is
     # zero-filled into `action` below, which would be a fabricated ground-truth value.
     cmd_covered: set[str] = set()
@@ -377,16 +325,13 @@ def build_episode(
         cmd_joints = joint_cmd_cursor.get(ts) or {}
         head_timestamps_ns.append(ts)
         cmd_covered.update(cmd_joints)
-        left_state = (left_ee_cursor.get(ts) or {}).get(left_gripper_name, left_closed)
-        right_state = (right_ee_cursor.get(ts) or {}).get(right_gripper_name, right_closed)
-        left_openness, right_openness = vr_cursor.get(ts) or (None, None)
-        openness_series.append((left_openness, right_openness))
+        left_gripper = (left_ee_cursor.get(ts) or {}).get(left_gripper_name, GRIPPER_CLOSED_RAD)
+        right_gripper = (right_ee_cursor.get(ts) or {}).get(right_gripper_name, GRIPPER_CLOSED_RAD)
 
-        left_action = left_closed + left_openness * (left_open - left_closed) if left_openness is not None else left_state
-        right_action = right_closed + right_openness * (right_open - right_closed) if right_openness is not None else right_state
-
-        state_vec = [state_joints.get(n, 0.0) for n in joint_names] + [left_state, right_state]
-        action_vec = [cmd_joints.get(n, 0.0) for n in joint_names] + [left_action, right_action]
+        # The gripper has no joint_cmd channel, so its action is the measured joint angle
+        # at this same frame (state and action gripper columns are therefore identical).
+        state_vec = [state_joints.get(n, 0.0) for n in joint_names] + [left_gripper, right_gripper]
+        action_vec = [cmd_joints.get(n, 0.0) for n in joint_names] + [left_gripper, right_gripper]
 
         frame = {
             "observation.state": np.array(state_vec, dtype=np.float32),
@@ -426,14 +371,6 @@ def build_episode(
             len(gaps), max(g["dt_s"] for g in gaps),
         )
 
-    mapping_verifiable = _gripper_mapping_verifiable(openness_series)
-    if not mapping_verifiable:
-        logger.warning(
-            "Both grippers moved together throughout this recording, so it cannot confirm the "
-            "VR controller left/right mapping (see vr_trigger_parser). Gripper actions may be "
-            "swapped; treat gripper metrics as unverified."
-        )
-
     _write_conversion_sidecar(output_root, sidecar_name, {
         "schema_version": 1,
         "source_recording": recording_dir.name,
@@ -458,11 +395,8 @@ def build_episode(
         "gripper": {
             "left_name": left_gripper_name,
             "right_name": right_gripper_name,
-            "left_open": left_open,
-            "left_closed": left_closed,
-            "right_open": right_open,
-            "right_closed": right_closed,
-            "lr_mapping_verifiable_from_this_recording": mapping_verifiable,
+            "action_source": "measured_ee_data",
+            "convention": "0.0=closed, -0.785=open",
         },
     })
 

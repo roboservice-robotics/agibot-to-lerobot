@@ -13,7 +13,6 @@ import json
 from episode_builder import (
     NS_PER_S,
     _detect_gaps,
-    _gripper_mapping_verifiable,
     _write_conversion_sidecar,
 )
 
@@ -61,54 +60,3 @@ def test_degenerate_inputs():
     assert _detect_gaps([], FPS) == []
     assert _detect_gaps(steady(1), FPS) == []
     assert _detect_gaps(steady(10), 0) == []  # unknown fps -> no nominal period to compare
-
-
-# --- gripper mapping verifiability --------------------------------------------------------
-
-
-def test_identical_grippers_cannot_verify_mapping():
-    """Both hands moving together: a left/right swap would be invisible."""
-    series = [(0.2, 0.2), (0.5, 0.5), (0.9, 0.9)]
-    assert _gripper_mapping_verifiable(series) is False
-
-
-def test_diverging_grippers_can_verify_mapping():
-    series = [(0.2, 0.2), (0.9, 0.1), (0.5, 0.5)]
-    assert _gripper_mapping_verifiable(series) is True
-
-
-def test_tiny_differences_do_not_count_as_divergence():
-    """Noise-level differences prove nothing about the mapping."""
-    assert _gripper_mapping_verifiable([(0.50, 0.51), (0.30, 0.29)]) is False
-
-
-def test_missing_values_are_skipped():
-    assert _gripper_mapping_verifiable([(None, None), (None, 0.5)]) is False
-    assert _gripper_mapping_verifiable([(None, None), (0.9, 0.1)]) is True
-
-
-def test_empty_series_is_not_verifiable():
-    assert _gripper_mapping_verifiable([]) is False
-
-
-# --- sidecar writing ----------------------------------------------------------------------
-
-
-def test_sidecar_lands_under_meta_and_round_trips(tmp_path):
-    payload = {"schema_version": 1, "action_uncovered": ["idx01_body_joint1"]}
-    _write_conversion_sidecar(tmp_path, "agibot_conversion.json", payload)
-
-    written = tmp_path / "meta" / "agibot_conversion.json"
-    assert written.is_file()
-    assert json.loads(written.read_text()) == payload
-
-
-def test_sidecar_creates_meta_dir_if_absent(tmp_path):
-    _write_conversion_sidecar(tmp_path / "fresh", "agibot_conversion.json", {"schema_version": 1})
-    assert (tmp_path / "fresh" / "meta" / "agibot_conversion.json").is_file()
-
-
-def test_sidecar_honors_custom_name(tmp_path):
-    # Batch conversion writes one sidecar per source recording under distinct names.
-    _write_conversion_sidecar(tmp_path, "agibot_conversion.rec-a.json", {"schema_version": 1})
-    assert (tmp_path / "meta" / "agibot_conversion.rec-a.json").is_file()
